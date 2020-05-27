@@ -7,7 +7,7 @@ local hex = require "util.hex";
 local jwt = require "luajwtjitsi";
 local http = require "net.http";
 local jid = require "util.jid";
-local json_safe = require "cjson.safe";
+local json = require "cjson";
 local path = require "util.paths";
 local sha256 = require "util.hashes".sha256;
 local timer = require "util.timer";
@@ -99,6 +99,20 @@ function Util.new(module)
 
     return self
 end
+
+function dump(o)
+   if type(o) == 'table' then
+      local s = '{ '
+      for k,v in pairs(o) do
+         if type(k) ~= 'number' then k = '"'..k..'"' end
+         s = s .. '['..k..'] = ' .. dump(v) .. ','
+      end
+      return s .. '} '
+   else
+      return tostring(o)
+   end
+end
+
 
 function Util:set_asap_key_server(asapKeyServer)
     self.asapKeyServer = asapKeyServer
@@ -255,10 +269,7 @@ function Util:process_and_verify_token(session)
     if self.asapKeyServer and session.auth_token ~= nil then
         local dotFirst = session.auth_token:find("%.");
         if not dotFirst then return nil, "Invalid token" end
-        local header, err = json_safe.decode(basexx.from_url64(session.auth_token:sub(1,dotFirst-1)));
-        if err then
-            return false, "not-allowed", "bad token format";
-        end
+        local header = json.decode(basexx.from_url64(session.auth_token:sub(1,dotFirst-1)));
         local kid = header["kid"];
         if kid == nil then
             return false, "not-allowed", "'kid' claim is missing";
@@ -277,6 +288,7 @@ function Util:process_and_verify_token(session)
         claims, msg = self:verify_token(session.auth_token, self.appSecret);
     end
     if claims ~= nil then
+        module:log("debug", "claims: %s", dump(claims));
         -- Binds room name to the session which is later checked on MUC join
         session.jitsi_meet_room = claims["room"];
         -- Binds domain name to the session
@@ -286,17 +298,25 @@ function Util:process_and_verify_token(session)
         if claims["context"] ~= nil then
           if claims["context"]["user"] ~= nil then
             session.jitsi_meet_context_user = claims["context"]["user"];
+          else
+            module:log("debug", "claims.context.user is nil.");
           end
 
           if claims["context"]["group"] ~= nil then
-            -- Binds any group details to the session
-            session.jitsi_meet_context_group = claims["context"]["group"];
+            -- Binds any group details to the session 
+           session.jitsi_meet_context_group = claims["context"]["group"];
+          else
+            module:log("debug", "claims.context.group is nil.");
           end
 
           if claims["context"]["features"] ~= nil then
             -- Binds any features details to the session
             session.jitsi_meet_context_features = claims["context"]["features"];
+          else
+            module:log("debug", "claims.context.features is nil.");
           end
+        else
+          module:log("debug", "claims.context is nil.");
         end
         return true;
     else
@@ -331,7 +351,11 @@ function Util:verify_room(session, room_address)
     end
 
     local auth_room = session.jitsi_meet_room;
+
+    module:log("debug", "Jitsi Meet Room: %s", session.jitsi_meet_room );
+
     if not self.enableDomainVerification then
+        module:log("error", "not self.enableDomainVerification");
         -- if auth_room is missing, this means user is anonymous (no token for
         -- its domain) we let it through, jicofo is verifying creation domain
         if auth_room and room ~= string.lower(auth_room) and auth_room ~= '*' then
@@ -341,63 +365,39 @@ function Util:verify_room(session, room_address)
         return true;
     end
 
+    if auth_room == nil then
+        module:log("debug", "auth_room is nil.");
+        return true;
+    end
+
+    module:log("debug", "Room from token: %s", session.jitsi_meet_room );
+    module:log("debug", "Group from token: %s", session.jitsi_meet_context_group );
+
     local room_address_to_verify = jid.bare(room_address);
     local room_node = jid.node(room_address);
     -- parses bare room address, for multidomain expected format is:
     -- [subdomain]roomName@conference.domain
     local target_subdomain, target_room = room_node:match("^%[([^%]]+)%](.+)$");
 
-    -- if we have '*' as room name in token, this means all rooms are allowed
-    -- so we will use the actual name of the room when constructing strings
-    -- to verify subdomains and domains to simplify checks
-    local room_to_check;
-    if auth_room == '*' then
-        -- authorized for accessing any room assign to room_to_check the actual
-        -- room name
-        if target_room ~= nil then
-            -- we are in multidomain mode and we were able to extract room name
-            room_to_check = target_room;
-        else
-            -- no target_room, room_address_to_verify does not contain subdomain
-            -- so we get just the node which is the room name
-            room_to_check = room_node;
-        end
-    else
-        -- no wildcard, so check room against authorized room in token
-        room_to_check = auth_room;
+    module:log("debug", "Requested subdomain: %s ", target_subdomain);
+
+    module:log("debug", "Requested room: %s ", target_room);
+
+    -- check if token group matches the requested subdomain
+    if string.lower(session.jitsi_meet_context_group) ~= string.lower(target_subdomain) then
+        return false;
     end
 
-    local auth_domain = session.jitsi_meet_domain;
-    local subdomain_to_check;
-    if target_subdomain then
-        if auth_domain == '*' then
-            -- check for wildcard in JWT claim, allow access if found
-            subdomain_to_check = target_subdomain;
-        else
-            -- no wildcard in JWT claim, so check subdomain against sub in token
-            subdomain_to_check = auth_domain;
-        end
-        -- from this point we depend on muc_domain_base,
-        -- deny access if option is missing
-        if not self.muc_domain_base then
-            module:log("warn", "No 'muc_domain_base' option set, denying access!");
-            return false;
-        end
+    -- If token room is '*' then user can create any room
+    if session.jitsi_meet_room == '*' then
+        return true;
+    end
 
-        return room_address_to_verify == jid.join(
-            "["..string.lower(subdomain_to_check).."]"..string.lower(room_to_check), self.muc_domain);
+    -- Check if token room matches the requested room
+    if string.lower(session.jitsi_meet_room) == string.lower(target_room) then
+        return true;
     else
-        if auth_domain == '*' then
-            -- check for wildcard in JWT claim, allow access if found
-            subdomain_to_check = self.muc_domain;
-        else
-            -- no wildcard in JWT claim, so check subdomain against sub in token
-            subdomain_to_check = self.muc_domain_prefix.."."..auth_domain;
-        end
-        -- we do not have a domain part (multidomain is not enabled)
-        -- verify with info from the token
-        return room_address_to_verify == jid.join(
-            string.lower(room_to_check), string.lower(subdomain_to_check));
+        return false;
     end
 end
 
